@@ -315,11 +315,11 @@ champion 只在任务边界更新。新任务由 `HarnessLoader` 加载新 ref�
 
 ## 12. 设计参考
 
-- [Prime Agent refinement implementation](../../agentfw/prime-agent/packages/coding-agent/src/core/refinement/refinement.ts)
-- [Prime Agent IPython tool](../../agentfw/prime-agent/packages/coding-agent/src/core/tools/ipython.ts)
-- [Prime Agent kernel manager](../../agentfw/prime-agent/packages/coding-agent/src/core/kernel/index.ts)
-- [Prime Agent RLM programming model](../../agentfw/prime-agent/packages/coding-agent/docs/rlm.md)
-- [DSH command subsystem](../../agentfw/deepseek-harness/docs/subsystems/commands.md)
+- [Prime Agent refinement implementation](../../prime-agent/packages/coding-agent/src/core/refinement/refinement.ts)
+- [Prime Agent IPython tool](../../prime-agent/packages/coding-agent/src/core/tools/ipython.ts)
+- [Prime Agent kernel manager](../../prime-agent/packages/coding-agent/src/core/kernel/index.ts)
+- [Prime Agent RLM programming model](../../prime-agent/packages/coding-agent/docs/rlm.md)
+- [DSH command subsystem](../deepseek-harness/docs/subsystems/commands.md)
 - [Hitch README](../../agent-hitch/README.md)
 - [Hitch design](../../agent-hitch/docs/design.md)
 - [Hitch Harbor evaluation](../../agent-hitch/docs/evals.md)
