@@ -1,10 +1,11 @@
 # DSH Self-Evolving Harness Plugin Spec
 
-- 状态：Draft v0.2
+- 状态：Draft v0.3
 - 目标运行时：DeepSeek Harness（DSH）
 - 设计参考：Prime Agent persistent IPython + `/refine`
 - 版本与评测后端：Hitch 0.1.x
 - 更新：2026-08-19 — v0.2：采纳"cell 执行入 session 日志"的日志重建原则；补充双层模型与成本分层；轨迹 JSONL 消费契约；baseline 复用；评测两层隔离；DSH 落地规范要求
+- 更新：2026-08-19 — v0.3：按 DSH 与 agent-hitch 源码核查结果修订——V1 动作空间按 DSH 现有能力逐项标注落地现状并给出收窄规则；Hitch 集成写明三件实际交付物（adapter 源码修改、DSH stdout NDJSON 事件输出模式、eval 本地源限制与 V1 绕行路线）；新增 HarnessLoader 装配落点映射（preset / skill provider / systemPrompt section）；新增评测过拟合防护与待验证假设
 
 ## 1. 目标
 
@@ -137,19 +138,30 @@ type ArtifactOp =
   | { type: 'delete'; path: string; expectedDigest: string }
 ```
 
-V1 动作空间：
+V1 动作空间，按 DSH 现有能力标注落地现状（核查于 2026-08-19）：
 
-| Target | 可修改组件 |
-| --- | --- |
-| `context` | supplemental system prompt、skill catalog、tool visibility、history policy、memory retrieval、ordering |
-| `pre_action` | validation、routing、planning |
-| `post_action` | normalization、reflection、retry、experience extraction、workflow update |
-| `skill` | trigger、policy、capabilities、context、verifier、recovery |
-| `routing` | tool、skill、subagent routing；模型和 provider 固定 |
-| `memory` | retrieval、write policy、retention |
-| `verifier` | correctness、quality、safety、cost；candidate verifier 不能单独决定自身 promotion |
+| Target | 可修改组件 | DSH 落地现状 |
+| --- | --- | --- |
+| `context` | supplemental system prompt、skill catalog、tool visibility、history/compaction policy、ordering | **现成**：`ctx.systemPrompt.section()`（agent scope，order 约定见 system-prompt 包）；`ctx.skills` 分层 catalog；preset 组合决定 tool visibility；`compaction-basic` config（thresholdRatio、retainTokens、per-model modelPolicies） |
+| `pre_action` | validation、routing、planning | **现成**：`agent/pre-step`、`tools/pre-execute` waterfall listener（overlay 以插件/preset 文件形态承载） |
+| `post_action` | normalization、retry、experience extraction、reflection、workflow update | **部分现成**：normalization 走 `tools/post-execute`，retry 存在于 compaction policy 与 tools waterfall；experience extraction 与 reflection 在 DSH **无对应组件**，V1 不开放（需先建 substrate） |
+| `skill` | 正文与 catalog、invocation policy、trigger、verifier、recovery | **受限现成**：DSH skill 是 `SKILL.md` + frontmatter，一等字段仅 `modelInvocable`/`userInvocable` + 自由 `metadata` 透传；trigger/verifier/recovery 语义经 `SkillCandidate.metadata` 承载、由 refine 插件解释执行，不改 skill schema |
+| `routing` | tool、skill、subagent routing | **现成**：分层 registry + preset + `ctx.subagents` 多后端；模型和 provider 固定 |
+| `memory` | retrieval、write policy、retention | **受限现成**：DSH 无独立 memory 组件，V1 仅开放 compaction policy；独立 memory substrate 后续版本再议 |
+| `verifier` | correctness、quality、safety、cost | **需新建**：以 overlay `workflows/` 内脚本承载；candidate verifier 不能单独决定自身 promotion |
+
+**V1 收窄规则**：只有标注"现成"或"受限现成"的组件可产生可应用的 mutation；标注"需先建 substrate"或"无对应组件"的子项，meta agent 的 proposal 一律走 rejected-for-substrate 决策——记录意图与证据、不应用，待人工实现 substrate 后在后续版本开放。校验器按本表实现白名单。
 
 默认一次 Mutation 只能命中表中的一个组件。绝对路径、`..`、symlink escape、任意 shell operation 和修改 evaluator/Hitch/权限的操作必须被拒绝。
+
+### HarnessLoader 的 DSH 装配落点
+
+DSH 没有 overlay 差量装配原语（`packages/extensions` 的 `cordis_mount` 是进程内存级挂载，无持久化/晋升路径，明确**不用于** champion 装配，仅供 meta agent 在受控 session 内做一次性实验）。champion/candidate 的加载由既有机制组合完成：
+
+- **整体载体：agent preset**（`packages/preset/agent-presets`）。candidate commit 由 `HarnessLoader` 物化为一个 preset 目录（`agent.cordis.yml` 引用 overlay 文件），在 agent scope 下挂载、随 session 生命周期回收，resume/fork 重建同款组合。preset 是文件级组合、无 patch 语义——`HarnessMutation` 的 ops 在专用 harness repo 中先解析为完整 artifact 树再 commit；DSH 侧永远加载完整树，不在运行时做 diff 合并。
+- **skill：自定义 SkillProvider**（`ctx.skills.registerProvider()`，`skill-badge` 为 60 行范例）。provider 在 candidate preset 的 scope 层注册、`locator` 指向 harness commit 内的 skill 文件；同名 skill 依 nearest-layer-wins 被 candidate 层覆盖。轻量替代：`skill-filesystem` 的 `customSkillDirs` 指向 overlay `skills/` 目录（零自定义代码，但失去版本语义）。
+- **supplemental prompt：`ctx.systemPrompt.section()`**（agent scope 注册）。
+- **自修改不落运行时**：所有 mutation 只经 harness repo commit 生效；`cordis_mount` 类运行时挂载产生的状态不持久、不参评。
 
 ## 6. `/refine` 合同
 
@@ -167,7 +179,7 @@ refinement 循环由两个模型角色构成，角色分离是刻意的：
 
 | 角色 | 职责 | 模型策略 |
 | --- | --- | --- |
-| **meta agent（外层）** | 读轨迹、verifier 结果和 refinement history，输出 `HarnessMutation`；只做决策，不执行任务 | 成本分层：使用便宜的中档模型。harness-updating 能力不挑模型，贵模型不带来明显更好的提案 |
+| **meta agent（外层）** | 读轨迹、verifier 结果和 refinement history，输出 `HarnessMutation`；只做决策，不执行任务 | 成本分层：使用便宜的中档模型。harness-updating 能力不挑模型，贵模型不带来明显更好的提案（**未验证假设**，见下"待验证假设"） |
 | **rollout agent（内层）** | 用固定 dsh revision + candidate overlay 执行 Seed Task，产出轨迹 JSONL 和分数；只执行与产证据，不做决策 | 评测对等性：同一轮 baseline/candidate 使用完全相同模型、provider、sampling 参数（第 8 节） |
 
 两层之间的数据契约不对称：meta 产出 `HarnessMutation`（JSON，小、决策），rollout 产出轨迹（JSONL，大、证据）。meta agent（即下文流程中的 Evolution Agent）运行在独立 DSH session，拥有自己的 scope 和 session 日志，经 `/refine` 命令或 idle boundary 维护任务唤醒；它不接触 champion 之外未验证的 harness 内容。
@@ -188,14 +200,22 @@ refinement 循环由两个模型角色构成，角色分离是刻意的：
 
 champion 未改变时，baseline rollout 结果在相邻轮之间可复用；只有 candidate 需要全量评测。champion 变化后，下一轮必须重新执行 baseline。
 
+### 待验证假设
+
+- **"harness-updating 能力不挑模型"**：成本分层的前提，目前无证据。V1 安排同轮 A/B（相同 proposal 生成任务、两档模型）对照提案质量；证伪则 meta agent 升档，并修订成本模型。
+- **上下文外置的实际收益**：KV 命中率提升与推理成本下降是推理级推断，V1 记录 cell 输出截断率、compaction 触发频率与上下文长度分布作为间接证据。
+
 ## 7. Hitch 集成
 
 Harness Git commit 是版本 ID，Hitch 是 revision、artifact、run 和 eval 的权威执行记录：
 
 ```text
-hitch resolve dsh-evolving@commit:<sha> --json
-hitch prepare dsh-evolving@commit:<sha> --json
-hitch run --harness dsh-evolving@commit:<sha> --output jsonl ...
+# V1 对照评测走 hitch run（显式本地 git 源，本地 harness repo 可用）
+hitch resolve dsh-evolving@git+file://<harness-repo>#<sha> --json
+hitch prepare dsh-evolving@git+file://<harness-repo>#<sha> --json
+hitch run --harness dsh-evolving@git+file://<harness-repo>#<sha> --output jsonl ...
+
+# executable candidate 阶段启用 Harbor eval（需 registered remote source，见下）
 hitch eval run --backend harbor --harness dsh-evolving@commit:<sha> ...
 ```
 
@@ -208,7 +228,11 @@ V1 直接复用 Hitch 已实现的：
 - authenticated daemon queue；
 - Harbor eval、trial 和 reward records。
 
-需要新增一个薄的 Hitch harness definition：`dsh-evolving`。它负责从指定 commit 构建 DSH overlay，固定 `dshRevision`，并启动 DSH headless profile；不得重写 Hitch resolver、artifact store、scheduler 或 process supervisor。
+需要新增 Hitch harness definition：`dsh-evolving`。这包含三件实际交付物（v0.2 称"薄"，按源码核查修订如下）：
+
+1. **Hitch adapter（源码修改，非配置扩展）**。Hitch 的适配器注册表硬编码在 `src/adapters.js` 的 `definitions` 对象（现有 codex/claude/pi/opencode，各约 60 行：`id/command/path_env/version_args/revision_sources/capabilities/process()/translate()`），没有配置级插件面——新增定义是对 agent-hitch 仓库的源码提交。`revision_sources.commit` 声明 harness overlay repo 的 Git URL、构建命令与 entrypoint；构建命令负责固定 `dshRevision`（安装/检出指定 dsh 版本）并把 overlay 物化为可执行入口（如包装脚本 `dsh --profile headless --patch <overlay.cordis.yml>`）。不得重写 Hitch resolver、artifact store、scheduler 或 process supervisor。
+2. **DSH stdout NDJSON 事件输出模式（DSH 侧交付物）**。Hitch run 引擎只消费子进程 stdout 的逐行 JSON（`engine.js` `consumeLines` → `adapter.translate()` 归一化为 `session.created`/`message.delta`/`tool.started`/`tool.completed`/`usage.updated`/`diagnostic`），prompt 经 stdin 传入。DSH headless 目前只把最终 assistant 纯文本写 stdout——**不新增此模式，轨迹 JSONL 契约就没有数据源**。实现是一个薄插件/flag：订阅 `session/event`，逐行 JSON 写 stdout；与最终文本输出互斥或并存（并存时 adapter 只解析 JSON 行，纯文本行走 `process.stdout` 事件）。
+3. **eval 本地源限制与 V1 绕行**。`hitch eval`（`evals.js`）有两个硬守卫：harness_ref 必须为不可变 ref（可满足）；**拒绝 local `git+file` 源、要求 registered remote Git source**。自进化 harness repo 是本地 Git 仓库，candidate commit 不在 adapter 注册的远端 URL 上。V1 处理：**对照评测不经 `hitch eval`**——用 `hitch run`（支持 `git+file://…#<sha>` 显式本地源）执行参数完全一致的 baseline/candidate 两次 run，`RefineService` 读取各自 run 目录的 `events.jsonl` 计算分数差。这与 V1 只自动接受 declarative mutation 的安全边界一致（declarative 变更无需进程隔离）。executable hook/tool candidate 阶段再启用 Harbor eval，届时三选一：放宽该守卫（agent-hitch 为自有仓库，改动数行）、为 harness repo 挂真实远端、或注册 file remote；且 dsh + Node 22 + kernel Python 栈需可进 Harbor 镜像（另行解决镜像构建）。
 
 Hitch Harbor 一次只评测一个 Harness ref，因此 baseline 和 candidate 使用两次参数完全一致的 eval，由 `RefineService` 合并结果。Hitch workspace 不是安全 sandbox；executable hook/tool candidate 必须使用 Harbor Docker。
 
@@ -228,7 +252,7 @@ interface RefinementRecord {
   mutationRef?: string
   baselineRunRefs: string[]
   candidateRunRefs: string[]
-  decision: 'accepted' | 'rejected' | 'failed'
+  decision: 'accepted' | 'rejected' | 'rejected-for-substrate' | 'failed'
   scoreDelta?: number
   createdAt: string
 }
@@ -247,6 +271,15 @@ baseline 和 candidate 必须使用相同：
 - verifier 和评分公式。
 
 自动接受仅适用于 declarative mutation。修改 executable hook、tool 或 verifier code 的 candidate 即使得分更高，也需要人工确认；权限、网络、credential、模型和 evaluator 变更永不自动接受。
+
+### 过拟合防护
+
+Seed Task Set 是固定的优化目标，存在 harness 进化为"针对该任务集与 verifier 的过拟合器"的风险（reward hacking 入口）。V1 规则：
+
+- 在 seed 任务集之外维护一个 **held-out 子集**（同分布、不参与证据引用与 proposal 生成）；champion 切换前在 held-out 上复核，回归超过阈值则拒绝 promotion 并记录；
+- held-out 集定期轮换；轮换后相邻轮的 baseline 复用失效，必须重跑；
+- refinement history 记录每个 accepted mutation 在 held-out 上的 delta，供外层分析漂移趋势；
+- verifier 结果只对 seed 任务集声明效力；任何 proposal 的 evidenceRefs 不得引用 held-out 数据。
 
 ### 两层隔离
 
@@ -282,12 +315,13 @@ champion 只在任务边界更新。新任务由 `HarnessLoader` 加载新 ref�
 
 作为 DSH package 落地时，必须满足仓库开发规范：
 
-- `refine/*` 类型化事件域（`cell/run`、`refine/start`、`refine/decision` 等），每个事件带 `@mode` 与 payload `@param`，经声明合并注册；
+- `refine/*` 类型化事件域（`cell/run`、`refine/start`、`refine/decision` 等），每个事件带 `@mode` 与 payload `@param`，经声明合并注册；新增事件域后必须跑 `pnpm run gen-persistence-catalog`（否则 resume 拒绝日志——未知非 ignorable 事件类型会使重建失败）；
 - Python 运行时按 capability seam 拆分（Service Definition / Provider / Consumer），并论证与既有 `code-runtime`、`terminal` 缝的边界；
 - 包级 `./invariant`：如"accepted 记录必有一对 baseline/candidate Hitch run refs""champion 必为已验证 ref"；
 - 非 unit REAL-composition 测试（boot cordis.yml 断言 durable 输出）、关键路径 snapshot、HMR-safe dispose 测试；
 - 模型可见工具（IPython、refine 相关）确定 UI render intent（`generic`/`terminal`/`diff`）；
 - 跨边界 id（`HarnessRef`、`RoundId`、`MutationRef`）使用 `Branded<B>`；
+- DSH headless 的 stdout NDJSON 事件输出模式（Hitch adapter 的轨迹来源）作为前置 PR 单独交付，含 keyless snapshot 测试；
 - 同步更新 packages README、module-graph、docs/architecture.md 扩展点表；附 Agent Note。
 
 ### 验收条目
@@ -297,7 +331,9 @@ champion 只在任务边界更新。新任务由 `HarnessLoader` 加载新 ref�
 - proposal 只能包含动作空间内的单一语义修改，并携带 evidence 和 expected outcome；
 - parent digest 冲突时 candidate 不会被部分应用；
 - 每个 candidate 都对应一个 exact Hitch commit ref，重复 resolve 得到相同 identity；
-- baseline/candidate 评测除 Harness diff 外完全一致，并能反查 Hitch run/eval records；
+- baseline/candidate 评测除 Harness diff 外完全一致，并能反查 Hitch run/eval records（V1 为两次 `hitch run` 的 `events.jsonl`；Harbor 阶段为 eval records）；
+- proposal 命中"需先建 substrate"组件时走 rejected-for-substrate，不产生 candidate commit；
+- accepted mutation 在 held-out 子集上复核通过，未通过者不改变 champion；
 - rejected/failed candidate 不改变 champion，accepted candidate 只在任务边界生效；
 - rollback 不重建旧版本，只切换到已有 immutable ref；
 - DSH plugin 不复制 Hitch 的版本解析、artifact cache、进程、workspace 或评测状态机；
@@ -320,7 +356,13 @@ champion 只在任务边界更新。新任务由 `HarnessLoader` 加载新 ref�
 - [Prime Agent kernel manager](../../prime-agent/packages/coding-agent/src/core/kernel/index.ts)
 - [Prime Agent RLM programming model](../../prime-agent/packages/coding-agent/docs/rlm.md)
 - [DSH command subsystem](../deepseek-harness/docs/subsystems/commands.md)
+- [DSH agent presets（HarnessLoader 载体）](../deepseek-harness/packages/preset/agent-presets/README.md)
+- [DSH skill seam（SkillProvider 接口）](../deepseek-harness/packages/skill/skill/src/index.ts)
+- [DSH extensions（内存级 mount，不用作 champion 装配）](../deepseek-harness/packages/extensions/README.md)
 - [Hitch README](../../agent-hitch/README.md)
 - [Hitch design](../../agent-hitch/docs/design.md)
 - [Hitch Harbor evaluation](../../agent-hitch/docs/evals.md)
+- [Hitch adapters（硬编码注册表）](../../agent-hitch/src/adapters.js)
+- [Hitch run engine（stdout NDJSON 消费）](../../agent-hitch/src/engine.js)
+- [Hitch evals（本地源守卫）](../../agent-hitch/src/evals.js)
 - [RSI Harness Action Space](https://my.feishu.cn/wiki/ZsTUwNqC6i0Ot0kVZqAcZqv3nrh)

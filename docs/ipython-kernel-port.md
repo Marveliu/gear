@@ -1,15 +1,16 @@
 # prime-agent IPython Kernel 移植决策
 
-- 状态：Draft v0.1
+- 状态：Draft v0.2
 - 目的：为 DSH 自进化 harness 插件（[spec](dsh-self-evolving-harness-spec.md)）的 `PythonNotebookRuntime` 组件提供移植决策
 - 参考实现：`../prime-agent/packages/coding-agent/src/core/kernel/`（KernelManager，1605 行）+ `src/core/tools/ipython.ts`（工具层）+ `prime-agent-runtime`（Python 侧 rlm shim）
 - 更新：2026-08-19 — 基于对 prime-agent 源码的完整阅读与四轮探索调研
+- 更新：2026-08-19 — v0.2：按 DSH 源码核查修正一处事实（"Python SDK 渲染器"实为 TS 侧 codegen `py-types.ts`，`python/` 目录无渲染器）；补 zeromq 原生依赖进 DSH 仓库的工程代价与决策记录
 
 ## 1. 结论
 
 prime-agent 的 IPython kernel 是一套**自研的 Jupyter wire protocol 客户端**（ZMQ 三通道 + HMAC 签名），配合 uv venv 自举、Linux fork-server 快启、dill 逐变量命名空间快照，构成"常驻内核 + 上下文外置"的 RLM 执行层。**核心（KernelManager + 工具层 + 快照）整体可移植到 DSH**，需要替换的外围只有三处：进程/会话生命周期钩子、`rlm` Python shim（替换为 spec 的预加载 typed API）、以及（可选）fork-server。
 
-移植边界论证：持久 kernel 落在 `ctx.codeRuntime` 缝的 **Provider** 角色上（`language: 'python'` 是 well-known 值、Consumer 的 Python SDK 渲染器已就绪、README 明言 persistent kernel 是 future work）；与 `ctx.terminals` 缝的边界是：**状态性像 terminal、语义像 code-runtime**——结果必须是结构化 `{value, logs, error}`（入 `tool/result` 日志可重放），而不是 PTY 字节流。
+移植边界论证：持久 kernel 落在 `ctx.codeRuntime` 缝的 **Provider** 角色上（`language: 'python'` 是 well-known 值、为 Python 语言生成模型可见 SDK 的 codegen 已就绪——注意实现在 TS 侧 `packages/core/tools/src/py-types.ts`，`python/` 目录本身无渲染器、只含 SDK 客户端与捆绑运行时定位器——README 明言 persistent kernel 是 future work）；与 `ctx.terminals` 缝的边界是：**状态性像 terminal、语义像 code-runtime**——结果必须是结构化 `{value, logs, error}`（入 `tool/result` 日志可重放），而不是 PTY 字节流。
 
 ## 2. 引入方式（wiring）
 
@@ -118,7 +119,7 @@ Node 侧:    handleCommMessage → handleHostRequest（按 data.type 查 hostHan
 
 | prime-agent 依赖 | DSH 侧 | 决策 |
 | --- | --- | --- |
-| `zeromq`（Dealer/Subscriber） | DSH 无 ZMQ 依赖 | 新增 `zeromq` npm 依赖（代码原样移植） |
+| `zeromq`（Dealer/Subscriber） | DSH 无 ZMQ 依赖 | 新增 `zeromq` npm 依赖（代码原样移植）。注意：**原生模块**——DSH 仓库当前零 ZMQ 依赖，且带 hygiene/publint 门禁与 Windows wine CI；引入前需确认预构建二进制的平台覆盖（macOS arm64/x64、Linux、Windows），必要时评估 prebuildify 或改用纯 JS 的 `js-zeromq` 替代（性能损失可接受性待基准） |
 | `@earendil-works/pi-ai` 的 `registerSessionResourceCleanup`/`cleanupSessionResources` | DSH session 生命周期 | 替换：挂 `session/disposed` 事件或 provider dispose |
 | `uv` + venv | 保留 | 机制原样，`PRIME_AGENT_KERNEL_PYTHON` → provider `Config.python` |
 | `prime-agent-runtime`（rlm shim） | 新建 spec 的 Python API 包 | 替换（见 §4） |
