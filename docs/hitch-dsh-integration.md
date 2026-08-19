@@ -1,9 +1,10 @@
 # Hitch ↔ DSH 对接改动
 
-- 状态：Draft v0.1
+- 状态：Draft v0.2
 - 目的：落实 [DSH 自进化 harness spec](dsh-self-evolving-harness-spec.md) §7 的三件交付物——`dsh-evolving` adapter、DSH stdout NDJSON 事件输出模式、eval 本地源守卫的处理。本文件是这三件事的具体改动设计；spec 只保留结论。
 - 代码基线：agent-hitch `src/`、DSH `packages/bundle/headless/`（2026-08-19 源码核查）
 - 更新：2026-08-19 — 初版
+- 更新：2026-08-19 — v0.2：纳入 agent-hitch 工作区新能力（未提交改动，核查于 2026-08-19）——`--resolved-revision-file` 锁定解析、`memory_mb` 容器内存控制、`HITCH_EVAL_BOOTSTRAP_DIR` 架构感知 bootstrap、eval 成功判据收紧。两处设计前提复核不变：adapter 注册表仍硬编码、eval 仍拒绝 local git+file 源
 
 ## 1. 为什么 Hitch 不能"装好直接用"
 
@@ -77,6 +78,14 @@ process(request, executable) {
 
 prompt 经 stdin 传入（Hitch 引擎统一 `child.stdin.end(specification.input)`）；workspace、timeout、取消由 Hitch 引擎管理，adapter 不管。
 
+### 2.3 `--resolved-revision-file`：锁定解析复用（工作区新能力）
+
+`hitch prepare` / `hitch run` 新增 `--resolved-revision-file <path>`（`cli.js`）：传入一份已 resolve 的 resolution JSON 代替重新解析，`readLockedResolution` 校验其 `identity` 非空且 `harness_id`/`canonical_ref` 与请求一致。对本设计的直接用途：
+
+- **baseline/candidate 钉同一 identity**：RefineService 每轮 resolve 一次 champion、一次 candidate，把两份 resolution 落盘，后续 prepare/run 全部经锁定文件执行——"重复 resolve 得到相同 identity"（spec 验收条目）由文件内容保证而非依赖解析器幂等；
+- **baseline 复用的实现点**：champion 未变时相邻轮直接复用同一份锁定 resolution 与 prepared artifact（缓存命中），不重复 resolve；
+- Harbor agent 内部已消费该能力（`hitch_harbor_agent.py` 的 `_resolution_option()`），外部调用与容器内行为一致。
+
 ## 3. 改动二：DSH stdout NDJSON 事件输出模式（DSH 侧前置 PR）
 
 ### 3.1 设计
@@ -130,7 +139,13 @@ DSH 侧改动：headless 增加 `--events jsonl`（命名以 DSH CLI 约定为�
 2. 为 harness repo 挂真实远端，adapter 注册该 URL；
 3. 维持本地 bare mirror + 注册 file URL（若 Hitch 后续放开）。
 
-倾向 1：改动最小且不引入网络依赖；Harbor 镜像构建（dsh + Node 22 + kernel Python 栈）另行解决，与本文件解耦。
+倾向 1：改动最小且不引入网络依赖。
+
+工作区新能力对 Harbor 阶段的影响（核查于 2026-08-19，agent-hitch 未提交改动）：
+
+- **`HITCH_EVAL_BOOTSTRAP_DIR`**：指定目录整体拷进 eval runtime（`materializeRuntime`），harbor agent 按容器架构（x64/arm64）预置 `node-$suffix`（优先于 nvm 安装）与 `state-$suffix`（预置 Hitch state 到 `/tmp/hitch-state`）——**Node 22 与预置 harness 状态可离线注入容器**，无需镜像内联网。"dsh + kernel Python 栈进 Harbor 镜像"的剩余部分：dsh 可经 bootstrap 的 state 预置其 prepared artifact；kernel Python/venv 需同样进 bootstrap（待验证 harbor agent 是否允许 bootstrap 携带非 Hitch 内容，实现时核对）。
+- **`memory_mb`（`--memory-mb`）**：eval 级容器内存上限，记入 request 与 plan——spec §8 "workspace image、seed、timeout、token budget 一致"的资源预算对齐有了显式旋钮，baseline/candidate 两次 eval 应传相同值。
+- **eval 成功判据收紧**：任一 trial errored/cancelled → eval failed（`n_errored`/`n_cancelled`）。分数消费语义：failed eval 不产生可比分数，RefineService 应把它归入 `decision: 'failed'` 而非"零分 candidate"。
 
 ## 5. 实施顺序与验收
 

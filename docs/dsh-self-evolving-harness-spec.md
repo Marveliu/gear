@@ -1,12 +1,13 @@
 # DSH Self-Evolving Harness Plugin Spec
 
-- 状态：Draft v0.3
+- 状态：Draft v0.3.2
 - 目标运行时：DeepSeek Harness（DSH）
 - 设计参考：Prime Agent persistent IPython + `/refine`
 - 版本与评测后端：Hitch 0.1.x
 - 更新：2026-08-19 — v0.2：采纳"cell 执行入 session 日志"的日志重建原则；补充双层模型与成本分层；轨迹 JSONL 消费契约；baseline 复用；评测两层隔离；DSH 落地规范要求
 - 更新：2026-08-19 — v0.3：按 DSH 与 agent-hitch 源码核查结果修订——V1 动作空间按 DSH 现有能力逐项标注落地现状并给出收窄规则；Hitch 集成写明三件实际交付物（adapter 源码修改、DSH stdout NDJSON 事件输出模式、eval 本地源限制与 V1 绕行路线）；新增 HarnessLoader 装配落点映射（preset / skill provider / systemPrompt section）；新增评测过拟合防护与待验证假设
 - 更新：2026-08-19 — v0.3.1：§7 的具体改动设计移入独立文档 [Hitch ↔ DSH 对接改动](hitch-dsh-integration.md)（adapter 形态、事件映射表、"为何不事后解析 session log"论证、实施顺序）
+- 更新：2026-08-19 — v0.3.2：纳入 agent-hitch 工作区新能力（未提交改动）——复用清单新增 `--resolved-revision-file`、`memory_mb`、`HITCH_EVAL_BOOTSTRAP_DIR`；详见对接文档 §2.3、§4
 
 ## 1. 目标
 
@@ -224,10 +225,11 @@ V1 直接复用 Hitch 已实现的：
 
 - exact commit resolution 和 content identity；
 - prepared artifact cache；
+- `--resolved-revision-file` 锁定解析复用（resolve 一次、钉住 identity、后续 prepare/run 复用；baseline 复用与 champion/candidate 钉同一 identity 的实现点）；
 - run supervision、timeout、cancel 和 terminal status；
 - `worktree | copy` workspace isolation；
 - authenticated daemon queue；
-- Harbor eval、trial 和 reward records。
+- Harbor eval、trial 和 reward records（含 `memory_mb` 容器内存控制与 `HITCH_EVAL_BOOTSTRAP_DIR` 架构感知 bootstrap，2026-08-19 工作区新增）。
 
 需要新增 Hitch harness definition：`dsh-evolving`。这包含三件实际交付物（v0.2 称"薄"，按源码核查修订如下）；具体改动设计（adapter 形态、事件映射表、"为何不事后解析 session log"的完整论证、实施顺序与验收）见 [Hitch ↔ DSH 对接改动](hitch-dsh-integration.md)：
 
