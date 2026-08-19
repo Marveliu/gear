@@ -1,6 +1,6 @@
 # DSH Self-Evolving Harness Plugin Spec
 
-- 状态：Draft v0.3.2
+- 状态：Draft v0.3.3
 - 目标运行时：DeepSeek Harness（DSH）
 - 设计参考：Prime Agent persistent IPython + `/refine`
 - 版本与评测后端：Hitch 0.1.x
@@ -8,6 +8,7 @@
 - 更新：2026-08-19 — v0.3：按 DSH 与 agent-hitch 源码核查结果修订——V1 动作空间按 DSH 现有能力逐项标注落地现状并给出收窄规则；Hitch 集成写明三件实际交付物（adapter 源码修改、DSH stdout NDJSON 事件输出模式、eval 本地源限制与 V1 绕行路线）；新增 HarnessLoader 装配落点映射（preset / skill provider / systemPrompt section）；新增评测过拟合防护与待验证假设
 - 更新：2026-08-19 — v0.3.1：§7 的具体改动设计移入独立文档 [Hitch ↔ DSH 对接改动](hitch-dsh-integration.md)（adapter 形态、事件映射表、"为何不事后解析 session log"论证、实施顺序）
 - 更新：2026-08-19 — v0.3.2：纳入 agent-hitch 工作区新能力（未提交改动）——复用清单新增 `--resolved-revision-file`、`memory_mb`、`HITCH_EVAL_BOOTSTRAP_DIR`；详见对接文档 §2.3、§4
+- 更新：2026-08-19 — v0.3.3：完整性补全——新增 §12 Seed Task Set 与分数（任务格式、seed repo 独立化、verifier 声明式、score=通过率、held-out 隔离由 handler 强制）；§6 新增并发/中断/预算语义（单 round 锁、中断轮标记 failed 不续跑、`--budget B`=rollout timeout）；§5 补 champion 运行时生效路径；§9 补 seed repo 布局；§10 补两条 seed 相关验收条目
 
 ## 1. 目标
 
@@ -160,7 +161,7 @@ V1 动作空间，按 DSH 现有能力标注落地现状（核查于 2026-08-19�
 
 DSH 没有 overlay 差量装配原语（`packages/extensions` 的 `cordis_mount` 是进程内存级挂载，无持久化/晋升路径，明确**不用于** champion 装配，仅供 meta agent 在受控 session 内做一次性实验）。champion/candidate 的加载由既有机制组合完成：
 
-- **整体载体：agent preset**（`packages/preset/agent-presets`）。candidate commit 由 `HarnessLoader` 物化为一个 preset 目录（`agent.cordis.yml` 引用 overlay 文件），在 agent scope 下挂载、随 session 生命周期回收，resume/fork 重建同款组合。preset 是文件级组合、无 patch 语义——`HarnessMutation` 的 ops 在专用 harness repo 中先解析为完整 artifact 树再 commit；DSH 侧永远加载完整树，不在运行时做 diff 合并。
+- **整体载体：agent preset**（`packages/preset/agent-presets`）。candidate commit 由 `HarnessLoader` 物化为一个 preset 目录（`agent.cordis.yml` 引用 overlay 文件），在 agent scope 下挂载、随 session 生命周期回收，resume/fork 重建同款组合。preset 是文件级组合、无 patch 语义——`HarnessMutation` 的 ops 在专用 harness repo 中先解析为完整 artifact 树再 commit；DSH 侧永远加载完整树，不在运行时做 diff 合并。**champion 的运行时生效路径**：session 创建时 `HarnessLoader` 读取 `.dsh-refine/champion.json`、将 champion 物化为 preset 并经 `ctx.agentPresets` 的发现/挂载机制装配（与 `agent-preset/selected` 同款路径）；已在运行的 session 不受影响（§8 任务边界原则）。
 - **skill：自定义 SkillProvider**（`ctx.skills.registerProvider()`，`skill-badge` 为 60 行范例）。provider 在 candidate preset 的 scope 层注册、`locator` 指向 harness commit 内的 skill 文件；同名 skill 依 nearest-layer-wins 被 candidate 层覆盖。轻量替代：`skill-filesystem` 的 `customSkillDirs` 指向 overlay `skills/` 目录（零自定义代码，但失去版本语义）。
 - **supplemental prompt：`ctx.systemPrompt.section()`**（agent scope 注册）。
 - **自修改不落运行时**：所有 mutation 只经 harness repo commit 生效；`cordis_mount` 类运行时挂载产生的状态不持久、不参评。
@@ -201,6 +202,12 @@ refinement 循环由两个模型角色构成，角色分离是刻意的：
 `--rounds N` 重复上述过程；下一轮只能基于上一轮接受的 champion。失败或拒绝的 candidate 不得成为后续 parent。
 
 champion 未改变时，baseline rollout 结果在相邻轮之间可复用；只有 candidate 需要全量评测。champion 变化后，下一轮必须重新执行 baseline。
+
+### 并发、中断与预算
+
+- 同一时刻至多一个 round；重复 `/refine` 调用拒绝并返回当前 round id（champion CAS 串行化的前提）；
+- round 各步骤状态持久化于 `rounds/<round-id>.json`；进程重启后中断轮直接标记 `failed`，不做断点续跑——champion 未变时 baseline 结果仍可复用，重跑成本仅 candidate 侧；
+- `--budget B` 语义：单任务 rollout 的 wall-clock timeout，经 Hitch `timeout_ms` 传递；token 预算依赖 rollout agent 侧既有配置（如 compaction policy），V1 不引入独立 token 限额机制。
 
 ### 待验证假设
 
@@ -303,6 +310,10 @@ champion 只在任务边界更新。新任务由 `HarnessLoader` 加载新 ref�
 <harness-repo>/
   harness/...
 
+<seed-repo>/
+  tasks/<task-id>/...
+  held-out/<task-id>/...
+
 <hitch-root>/
   store/
   runs/
@@ -336,6 +347,8 @@ champion 只在任务边界更新。新任务由 `HarnessLoader` 加载新 ref�
 - 每个 candidate 都对应一个 exact Hitch commit ref，重复 resolve 得到相同 identity；
 - baseline/candidate 评测除 Harness diff 外完全一致，并能反查 Hitch run/eval records（V1 为两次 `hitch run` 的 `events.jsonl`；Harbor 阶段为 eval records）；
 - proposal 命中"需先建 substrate"组件时走 rejected-for-substrate，不产生 candidate commit；
+- `<seed-task-ref>` 固定时重复 resolve 得到同一任务集与 verifier；verifier 命令的修改不在动作空间内；
+- proposal 的 evidenceRefs 引用 held-out 任务时被校验拒绝（由 Host Bridge handler 强制，非约定）；
 - accepted mutation 在 held-out 子集上复核通过，未通过者不改变 champion；
 - rejected/failed candidate 不改变 champion，accepted candidate 只在任务边界生效；
 - rollback 不重建旧版本，只切换到已有 immutable ref；
@@ -352,7 +365,37 @@ champion 只在任务边界更新。新任务由 `HarnessLoader` 加载新 ref�
 - 自动修改权限、credential、网络策略、模型、evaluator 或 DSH Agent Loop；
 - 把 IPython 当作安全 sandbox。
 
-## 12. 设计参考
+## 12. Seed Task Set 与分数
+
+Seed Task Set 是全文的优化目标与证据来源（`/refine <seed-task-ref>`、`seed_tasks.load()`、§8 parity 与 held-out），本节给出 V1 最小定义。
+
+### 任务格式与 ref 语义
+
+```ts
+interface SeedTask {
+  id: string                    // kebab-case，set 内唯一
+  prompt: string                // 发给 rollout agent 的任务文本
+  cwd?: string                  // 任务工作区（相对 seed repo 的路径），缺省为任务目录自身
+  verifier: {                   // 声明式评分器；不属于动作空间（§5），永不自动修改
+    command: string             // rollout 完成后在任务 workspace 执行；exit 0 = 通过
+    timeoutMs: number
+  }
+  tags?: string[]               // held-out 切分与漂移分析用
+}
+```
+
+- Seed Task Set 是**独立 Git repo**（`<seed-repo>/tasks/<task-id>/`：prompt、workspace 素材、verifier 脚本），`<seed-task-ref>` 即该 repo 的 commit sha——§8 "Seed Task revision 一致"由此保证；
+- seed repo（基准）、harness repo（被优化对象）、source repo（任务素材，若独立）三者分离：优化对象可变，基准与素材固定，分数差异才可归因于 harness diff；
+- rollout 经 Hitch 以 `worktree | copy` 隔离执行 workspace；verifier 命令由 `RefineService` 在 run 完成后于该 workspace 执行，结果与 run 记录一并归档。
+
+### 分数
+
+- V1 分数为通过率的确定函数：`score = passed / total`，每 task 一次 attempt；
+- 改善阈值（最小 score delta、held-out 回归阈值）是 `RefineService` 的 Config 字段，不写死（DSH 规范：部署级变量必须可配置）；
+- 连续分（部分分）需要 verifier 输出约定，V1 不做；
+- held-out 子集以 seed repo 内 `held-out/` 目录划分、随 seed repo 一并版本化；**隔离由 Host Bridge handler 强制**——`trajectory.query` 与 proposal 的 evidenceRefs 校验拒绝引用 held-out 任务，而非靠约定。
+
+## 13. 设计参考
 
 - [Hitch ↔ DSH 对接改动（本文档的 §7 落地方案）](hitch-dsh-integration.md)
 - [Prime Agent refinement implementation](../../prime-agent/packages/coding-agent/src/core/refinement/refinement.ts)

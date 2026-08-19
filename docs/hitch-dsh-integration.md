@@ -5,6 +5,7 @@
 - 代码基线：agent-hitch `src/`、DSH `packages/bundle/headless/`（2026-08-19 源码核查）
 - 更新：2026-08-19 — 初版
 - 更新：2026-08-19 — v0.2：纳入 agent-hitch 工作区新能力（未提交改动，核查于 2026-08-19）——`--resolved-revision-file` 锁定解析、`memory_mb` 容器内存控制、`HITCH_EVAL_BOOTSTRAP_DIR` 架构感知 bootstrap、eval 成功判据收紧。两处设计前提复核不变：adapter 注册表仍硬编码、eval 仍拒绝 local git+file 源
+- 更新：2026-08-19 — v0.2.1：§5 对照评测闭环补锁定解析的使用
 
 ## 1. 为什么 Hitch 不能"装好直接用"
 
@@ -153,7 +154,7 @@ DSH 侧改动：headless 增加 `--events jsonl`（命名以 DSH CLI 约定为�
 
 1. **DSH `--events jsonl` PR**：headless 事件投影 + 互斥输出；验收——同一 task 跑两遍，stdout JSONL 行集一致（除时间戳/id）；含 keyless snapshot 测试（DSH 仓库规范：模型可见行为变更必须带 keyless snapshot）；
 2. **adapter 源码提交**：验收——`hitch list --json` 出现 `dsh-evolving`；`hitch run --harness dsh-evolving@git+file://…#<sha>` 的 `events.jsonl` 含完整归一化事件（session.created、≥1 message.completed、tool.started/completed 成对）；
-3. **对照评测闭环**：同一 seed task 的 baseline/candidate 两次 run，参数除 harness ref 外逐字段一致（request.json diff 验证），RefineService 能从两个 run 目录算出分数差。
+3. **对照评测闭环**：同一 seed task 的 baseline/candidate 两次 run（均经 `--resolved-revision-file` 锁定 resolution，见 §2.3），参数除 harness ref 外逐字段一致（request.json diff 验证），RefineService 能从两个 run 目录算出分数差。
 
 ## 6. 参考
 
