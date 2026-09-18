@@ -14,13 +14,32 @@
 
 Gear 是一套开源优化框架，用于提升 AI Agent 在真实世界任务中的表现。
 
-首先，定义你的优化目标并准备一个能代表目标场景的 benchmark：可以使用现有 benchmark，也可以[构建带明确验收规则的任务集](docs/guide/zh-CN/datasets.md)。然后，使用 [Refine Skill](skills/refine/SKILL.md)，围绕这个 benchmark 优化你的 Agent。Gear 会反复评测并改进 Agent 的指令、工具和工作流程，最终得到一个针对该场景调优的 Agent。
+要让 Agent 适应目标场景，首先准备一个包含代表性任务、具有明确验收标准的 benchmark。你可以使用现有 benchmark，也可以[构建自己的任务集](docs/guide/zh-CN/datasets.md)。在这个 benchmark 上运行 [Refine Skill](skills/refine/SKILL.md)。Gear 会利用评测结果，迭代改进 Agent 的模型、指令、工具和工作流程。
+
+下面两个案例对比了 Luna Max 搭配 Gear 优化的 harness，与 Astra Max 搭配 Codex 在相同 AutomationBench 任务中的执行轨迹，展示它们如何读取信息、应用规则，并交付最终结果。
+
+<table>
+  <tr>
+    <th width="50%">落地页告警</th>
+    <th width="50%">精选摘要优化</th>
+  </tr>
+  <tr>
+    <td><a href="docs/guide/assets/landing-page-alerts-replay.mp4"><img src="docs/guide/assets/landing-page-alerts-replay.gif" width="100%" alt="轨迹回放：Luna Max 搭配 GEAR 将 Careers 纳入告警，Astra Max 搭配 Codex 则遗漏了该页面。"></a></td>
+    <td><a href="docs/guide/assets/featured-snippet-replay.mp4"><img src="docs/guide/assets/featured-snippet-replay.gif" width="100%" alt="轨迹回放：Luna Max 搭配 GEAR 将用户点名的 crm pricing 加入队列，Astra Max 搭配 Codex 则遗漏了该关键词。"></a></td>
+  </tr>
+  <tr>
+    <td>计分项通过数：Luna <strong>5/5</strong> · Astra <strong>4/5</strong><br><a href="docs/guide/assets/landing-page-alerts-replay.mp4">观看完整尺寸视频</a></td>
+    <td>计分项通过数：Luna <strong>2/2</strong> · Astra <strong>1/2</strong><br><a href="docs/guide/assets/featured-snippet-replay.mp4">观看完整尺寸视频</a></td>
+  </tr>
+</table>
 
 ## 小模型也可以和 SOTA 模型掰手腕
 
 在 AutomationBench 的 100 个公开 Marketing 任务上，GPT 5.6 Luna 使用 max 推理档位和经过 Gear 优化的 DSH harness，取得了 **88.88% 的目标完成率**，高于 GPT 6 Astra 使用 max 档位和 Codex 时的 **84.08%**。Luna 的任务通过率为 **53%**。
 
-![从原始 DSH harness 开始的 harness 优化与 GEPA 搜索：GPT 5.6 Luna 使用 max 档位，断言完成率达到 88.88%、任务通过率为 53%；GPT 6 Astra 使用 max 档位和 Codex 时，对应结果为 84.08% 和 57%。](docs/guide/assets/marketing-evolution-overview.png)
+两种模型使用同一版优化后的 DSH harness（`a0740800`）时，**Luna max 平均每题 API 等价费用约为 $0.0568，Astra max 为 $1.1858，Luna 低 95.21%**。
+
+![从原始 DSH harness 开始的 harness 优化与 GEPA 搜索：GPT 5.6 Luna 使用 max 档位，目标完成率达到 88.88%、任务通过率为 53%；GPT 6 Astra 使用 max 档位和 Codex 时，对应结果为 84.08% 和 57%。](docs/guide/assets/marketing-evolution-overview.png)
 
 ### 基准评测结果
 
@@ -41,7 +60,7 @@ Gear 是一套开源优化框架，用于提升 AI Agent 在真实世界任务�
 
 Luna 对比的是原始 harness 的 medium 推理档位与优化后 harness 的 max 档位。Astra 的 Marketing 成绩对比[原生 Codex](examples/evolution-search/codex-astra-max-evaluation.json) 与[优化后的 DSH harness](docs/guide/zh-CN/example-algorithm.md)，均使用 max 档位。优化后的 harness 直接使用 Astra 评测，没有新增优化轮次。Terminal-Bench 对照配置未经过 Gear 优化，成绩列在「优化前」，「优化后」与「提升」不适用；这些对照配置的推理档位见「配置」。
 
-[评分方式与来源](docs/guide/zh-CN/results.md) · [完整实验](docs/guide/zh-CN/example-algorithm.md)
+[评分方式与来源](docs/guide/zh-CN/results.md) · [Token 消耗与计费口径](docs/marketing-token-cost.zh-CN.md) · [完整实验](docs/guide/zh-CN/example-algorithm.md)
 
 ## 快速开始
 
