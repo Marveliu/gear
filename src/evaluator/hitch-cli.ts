@@ -1,6 +1,8 @@
 import { spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
-import { readFile, realpath } from 'node:fs/promises'
+import { lstat, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { delimiter, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { isDeepStrictEqual } from 'node:util'
@@ -72,6 +74,7 @@ type JsonRecord = Record<string, unknown>
 type HitchControlPlaneOptions = NonNullable<HitchConfig['controlPlane']>
 
 interface ParsedRunTrial {
+  originalResult: import('@deepseek-ai/dsh-session').JsonValue
   taskName: string
   trialName: string
   runId: string
@@ -1069,12 +1072,31 @@ export class HitchCliEvaluator implements RefineEvaluator, HitchTrajectoryReader
     // compiled dataset, including its adapter/scoring manifest, is unchanged.
     // Unknown legacy identities stay unresolved; the service must block reuse
     // rather than treating that uncertainty as permission to run more trials.
-    if (await this.hasStandardBenchmarkManifest(round, request)) {
+    const fileSelection = await lstat(resolve(round.workspaceRoot, request.dataset)).then(s => s.isFile()).catch(error => {
+      if (error.code !== 'ENOENT') throw error
+      return false
+    })
+    if (fileSelection || await this.hasStandardBenchmarkManifest(round, request)) {
       const datasetDigest = await digestDatasetRef(request.dataset, round.workspaceRoot)
       signal?.throwIfAborted()
       if (datasetDigest !== request.condition.dataset.digest) return undefined
     }
     return this.resolveEvaluationIdentity(round, request, signal)
+  }
+
+  async resourcePreflight(input: { ref: string; owner: string; generation: number }, signal: AbortSignal = new AbortController().signal): Promise<{
+    protocol: 'hitch-resource-preflight@1'; inputDigest: string; planDigest: string; plans: import('../state/resource-contract.js').ResourcePlan[]
+  }> {
+    const temp = await mkdtemp(join(tmpdir(), 'gear-resource-preflight-'))
+    try {
+      const file = join(temp, 'request.json'); await writeFile(file, JSON.stringify(input), { mode: 0o600 })
+      const result = await this.run([...this.rootArgs(), 'resources', 'request', 'preflight', '--input', file], this.repositoryPath, signal)
+      if (result.exitCode !== 0) throw new Error(`Hitch resource preflight failed: ${result.stderr}`)
+      const value = JSON.parse(result.stdout)
+      if (value?.protocol !== 'hitch-resource-preflight@1' || !Array.isArray(value.plans)) throw new Error('Hitch lacks the required resource preflight capability')
+      digest(value.inputDigest, 'resource input digest'); digest(value.planDigest, 'resource plan digest')
+      return value
+    } finally { await rm(temp, { recursive: true, force: true }) }
   }
 
   /** Reads the existing Hitch submission record; this adds no Hitch CLI command or protocol. */
@@ -1110,7 +1132,7 @@ export class HitchCliEvaluator implements RefineEvaluator, HitchTrajectoryReader
       await readFile(resolve(round.workspaceRoot, request.dataset, 'benchmark.adapter.json'))
       return true
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+      if (['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '')) return false
       throw error
     }
   }
@@ -2606,6 +2628,7 @@ export class HitchCliEvaluator implements RefineEvaluator, HitchTrajectoryReader
       summary,
       trials,
       invalidTrials: [],
+      originalResult: jsonValue(result, 'result'),
       localSourceTransport: transport,
     }
   }
@@ -2634,6 +2657,7 @@ export class HitchCliEvaluator implements RefineEvaluator, HitchTrajectoryReader
       )
     }
     const trials: HitchTrialSummary[] = valid.map(trial => ({
+      originalResult: trial.originalResult,
       taskName: trial.taskName,
       trialName: trial.trialName,
       runId: trial.runId,
@@ -2647,6 +2671,7 @@ export class HitchCliEvaluator implements RefineEvaluator, HitchTrajectoryReader
       scores: trial.scores ?? { totalScore: trial.reward!, normalization: 'legacy-reward' },
     }))
     const invalidTrials: InvalidEvaluationTrialSummary[] = invalidObservations.map(trial => ({
+      originalResult: trial.originalResult,
       taskName: trial.taskName,
       trialName: trial.trialName,
       runId: trial.runId,
@@ -2693,6 +2718,7 @@ export class HitchCliEvaluator implements RefineEvaluator, HitchTrajectoryReader
       summary,
       trials,
       invalidTrials,
+      originalResult: jsonValue(result, 'result'),
       localSourceTransport: transport,
     }
   }
@@ -2723,6 +2749,7 @@ export class HitchCliEvaluator implements RefineEvaluator, HitchTrajectoryReader
       if (attempt <= 0) throw new HitchEvaluationError(`trials[${index}].attempt must be positive`, 'invalid_hitch_result')
       return {
         taskName: string(trial.task_id, `trials[${index}].task_id`),
+        originalResult: jsonValue(trial, `trials[${index}]`),
         trialName: string(trial.trial_id, `trials[${index}].trial_id`),
         runId,
         attempt,
@@ -2756,7 +2783,7 @@ export class HitchCliEvaluator implements RefineEvaluator, HitchTrajectoryReader
         ...(rewards.process_score === undefined ? {} : { processScore: rewards.process_score }),
         normalization: rewards.total_score === undefined ? 'legacy-reward' : 'standard',
       }
-      return { taskName, ...(trialName === undefined ? {} : { trialName }), status: 'completed', rewards, scores }
+      return { taskName, ...(trialName === undefined ? {} : { trialName }), status: 'completed', rewards, scores, originalResult: jsonValue(trial, `summary.trials[${index}]`) }
     })
   }
 

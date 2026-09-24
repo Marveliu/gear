@@ -53,6 +53,7 @@ import { loadBundledRefineSkill, mountDshRefineSkill } from './skill/dsh.js'
 import './context.js'
 
 export * from './types.js'
+export * from './objective/index.js'
 export * from './config.js'
 export * from './capabilities.js'
 export * from './harness/builder.js'
@@ -587,6 +588,7 @@ export async function apply(ctx: Context, config: PluginConfig): Promise<void> {
     {
       workspaceRoot: config.workspaceRoot,
       metaAgent,
+      ...(config.datasetStorage ? { datasetStorage: config.datasetStorage } : {}),
       candidateGeneration,
       rollout,
       evaluation,

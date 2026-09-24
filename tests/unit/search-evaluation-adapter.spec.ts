@@ -1,22 +1,26 @@
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { lstat, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { identity as resourceIdentity } from '../../src/state/resource-protocol.js'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { EvaluationEvidence, EvaluationRequest, HitchTrajectoryReader, HitchVerifierEvidence, RefineEvaluator } from '../../src/types.js'
 import { RefineCapabilities } from '../../src/capabilities.js'
 import { digestJson } from '../../src/state/digest.js'
+import { RefineStateStore } from '../../src/state/store.js'
 import { digestDatasetRef } from '../../src/state/dataset.js'
 import { attachSearchEvaluation, EvaluationSearchAdapter } from '../../src/search/evaluation-adapter.js'
 import { FailureClusterSearch } from '../../src/search/engine.js'
 import { SearchBudgetExceeded, SearchStore } from '../../src/search/store.js'
 import { recoverExternal, SearchOperationPending } from '../../src/search/recovery.js'
-import { cellIdentity } from '../../src/search/evidence.js'
+import { cellIdentity, cellKey, verifyCells } from '../../src/search/evidence.js'
 import { stagePlan } from '../../src/search/scopes.js'
 import { resolveSizing, seal } from '../../src/search/contracts.js'
 import { settings, fixtures } from '../helpers/search-fixture.js'
 import { evolutionSpec, roundFixture } from '../helpers/research-fixture.js'
 import { standardSearchDataset } from '../helpers/standard-search-dataset.js'
 import type { EvaluationExecutionResult, Snapshot } from '../../src/search/types.js'
+import { resolveObjective } from '../../src/objective/contracts.js'
+import { objectiveProfile } from '../../src/search/objective.js'
 
 const roots: string[] = []
 afterEach(async () => { vi.restoreAllMocks(); await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true }))) })
@@ -37,7 +41,7 @@ async function setup(process = true, repetitions = 1, deferred = false, taskCoun
     reserve: async () => { const evalId = `eval-${++serial}`; reservations.set(evalId, runtime); return { provider: 'fixture-existing-evaluator', evalId } },
     async evaluate(_round, request, _signal, reservation) {
       requests.push(request)
-      const manifest = JSON.parse(await readFile(join(request.dataset, 'benchmark.adapter.json'), 'utf8'))
+      const manifest = JSON.parse(await readFile((await lstat(request.dataset)).isFile() ? request.dataset : join(request.dataset, 'benchmark.adapter.json'), 'utf8'))
       const trials = manifest.tasks.map((t: { task_id: string }) => {
         const runId = `${reservation!.evalId}-${t.task_id}`; runs.set(runId, t.task_id)
         const score = request.harnessRef === source.anchor.commit ? Number(t.task_id.slice(5)) % 5 === 0 ? 1 : 0.3 : 1
@@ -53,7 +57,8 @@ async function setup(process = true, repetitions = 1, deferred = false, taskCoun
     inspectVerifierEvidence: async (runId: string) => ({ runId, observation: { status: 'valid' }, verifier: { status: 'complete', feedback: { schemaVersion: 1,
       items: [{ code: `workflow-${Number(runs.get(runId)!.slice(5)) % 4}`, severity: 'error', message: 'Failed the fixture workflow' }] } } }),
   }
-  const store = new SearchStore(join(root, 'search')), options = { spec, workspaceRoot: root, stateRoot: store.root, identityRound: roundFixture({ workspaceRoot: root }),
+  const lock = await new RefineStateStore(root).acquireRoundLock()
+  const store = new SearchStore(join(root, 'search')), options = { lock: async () => lock, spec, workspaceRoot: root, stateRoot: store.root, identityRound: roundFixture({ workspaceRoot: root }),
     round: async () => roundFixture({ workspaceRoot: root }), manifest: async (snapshot: Snapshot) => ({ schemaVersion: 1 as const, dshBaseRef: source.anchor.commit, toolchainRef: 'fixture', sandboxProfileRef: 'fixture', digest: snapshot.manifestDigest,
       artifacts: [{ path: 'harness/main.ts', bytes: 1, digest: digestJson('file') }] }) }
   const provider = new EvaluationSearchAdapter(evaluator, options)
@@ -62,7 +67,282 @@ async function setup(process = true, repetitions = 1, deferred = false, taskCoun
   return { root, spec, source, requests, evaluator, provider, options, store, run, observations, search, reservations, cancelled, changeRuntime: () => { runtime = 'runtime-B' } }
 }
 
+async function batchInput(f: Awaited<ReturnType<typeof setup>>, taskIds: string[], key = 'batch-verification') {
+  const universe = await f.provider.describe('seed')
+  const plan = stagePlan({ stage: 'local', partition: 'seed', universeDigest: universe.digest,
+    taskSetSizeResolutionDigest: digestJson('sizing'), scopeDigest: digestJson('scope'), taskIds,
+    participantIds: [f.source.anchor.candidateId], prerequisiteDecisionDigests: [], selectionRuleDigest: digestJson('rule') })
+  return { plan, snapshot: f.source.anchor, cells: taskIds.map(id => cellIdentity(universe, id, 0, f.source.anchor)),
+    idempotencyKey: digestJson(key), signal: new AbortController().signal }
+}
+
+async function resourceSetup() {
+  const f = await setup(false, 1, false, 1)
+  const fixture = JSON.parse(await readFile('test-contracts/hitch-resources-v1.json', 'utf8'))
+  const { task_digest: unused, ...taskBody } = fixture.dataset.tasks[0]
+  const task = { ...taskBody, task_id: 'task-0' }
+  const { dataset_digest: ignored, ...body } = fixture.dataset
+  body.tasks = [{ ...task, task_digest: unused }]
+  const dataset = { ...body, dataset_digest: resourceIdentity('hitch-resource-dataset@2', body) }
+  await writeFile(join(f.spec.datasets.seed.ref, 'benchmark.adapter.json'), JSON.stringify(dataset))
+  f.spec.datasets.seed.digest = await digestDatasetRef(f.spec.datasets.seed.ref)
+  f.options.identityRound.plan.seed.dataset = f.spec.datasets.seed
+  const planBody = { protocol: 'hitch-resource-plan@1' as const, resolver: dataset.execution.resolver, backend: dataset.execution.backend, platform: dataset.execution.platform, task: body.tasks[0] }
+  const plans = [{ ...planBody, digest: resourceIdentity(planBody.protocol, planBody) }]
+  const preflight = { protocol: 'hitch-resource-preflight@1' as const, inputDigest: dataset.dataset_digest, plans, planDigest: resourceIdentity('hitch-resource-preflight@1', { inputDigest: dataset.dataset_digest, plans: plans.map(p => ({ taskId: p.task.task_id, digest: p.digest })) }) }
+  return { ...f, preflight }
+}
+
+describe('resource-aware admission and selection', () => {
+  it.each(['pin-ack', 'retention', 'cohort', 'batch'].flatMap(point => ['before', 'after'].map(phase => ({ point, phase }))))(
+    'recovers a resource freeze failure $phase $point without dangling frozen inputs or duplicate evaluation', async ({ point, phase }) => {
+      const f = await resourceSetup(), pins = new Map<string, number>()
+      let armed = false, interrupted = false
+      f.evaluator.resourcePreflight = async input => {
+        const crash = armed && !interrupted && point === 'pin-ack'
+        if (crash && phase === 'before') { interrupted = true; throw new Error('resource freeze crash') }
+        pins.set(input.owner, input.generation)
+        if (crash) { interrupted = true; throw new Error('resource freeze crash') }
+        return f.preflight
+      }
+      const input = await batchInput(f, ['task-0']); pins.clear(); armed = true
+      const original = SearchStore.prototype.write
+      const spy = vi.spyOn(SearchStore.prototype, 'write').mockImplementation(async function (this: SearchStore, name, value, beforePublish) {
+        const boundary = name === 'resource-retention/seed' ? 'retention' : name === 'evolution/evaluator-cohort-seed' ? 'cohort'
+          : name.startsWith('evolution/evaluator-input-') ? 'batch' : undefined
+        if (boundary) expect(pins.size).toBe(1)
+        const crash = armed && !interrupted && boundary === point
+        if (crash && phase === 'before') { interrupted = true; throw new Error('resource freeze crash') }
+        await original.call(this, name, value, beforePublish)
+        if (crash) { interrupted = true; throw new Error('resource freeze crash') }
+      })
+      await expect(f.provider.evaluate(input)).rejects.toThrow('resource freeze crash')
+      expect(interrupted).toBe(true); expect(f.requests).toHaveLength(0); expect(f.reservations.size).toBe(0)
+      const key = `evolution/evaluator-input-${input.idempotencyKey.slice(7)}`
+      const frozen = await f.store.read<{ ref: string }>(key)
+      if (frozen) {
+        expect(pins.size).toBe(1)
+        expect(await f.store.read('resource-retention/seed')).toMatchObject({ state: 'active', planDigest: f.preflight.planDigest })
+        expect((await f.store.object<{ digest: string }>(frozen.ref)).digest).toBe(frozen.ref)
+      }
+      spy.mockRestore()
+      const recovered = new EvaluationSearchAdapter(f.evaluator, f.options)
+      const result = await recovered.evaluate(input)
+      expect(result).toHaveLength(1); expect(f.requests).toHaveLength(1)
+      const resumed = new EvaluationSearchAdapter(f.evaluator, f.options)
+      expect(await resumed.evaluate(input)).toEqual(result)
+      expect(f.requests).toHaveLength(1); expect(f.reservations.size).toBe(1); expect(pins.size).toBe(1)
+      if (frozen) expect(await f.store.read(key)).toEqual(frozen)
+    },
+  )
+  it('rejects missing capability and mismatched plans before reservation or freezing', async () => {
+    const f = await resourceSetup()
+    await expect(f.provider.describe('seed')).rejects.toThrow(/preflight capability/)
+    f.evaluator.resourcePreflight = async () => ({ ...f.preflight, planDigest: digestJson('corrupt') })
+    await expect(f.provider.describe('seed')).rejects.toThrow(/aggregate/)
+    expect(f.reservations.size).toBe(0)
+    expect(await f.store.read('evolution/evaluator-cohort-seed')).toBeUndefined()
+  })
+  it('freezes metadata-only selections after pin acknowledgement and rechecks recovered plans', async () => {
+    const f = await resourceSetup()
+    f.evaluator.resourcePreflight = vi.fn(async () => f.preflight)
+    const input = await batchInput(f, ['task-0'])
+    const cells = await f.provider.evaluate(input)
+    expect(cells).toHaveLength(1)
+    expect((await lstat(f.requests[0]!.dataset)).isFile()).toBe(true)
+    const selection = JSON.parse(await readFile(f.requests[0]!.dataset, 'utf8'))
+    expect(selection.protocol).toBe('hitch-resource-selection@1')
+    expect(selection.tasks.map((t: {task_id: string}) => t.task_id)).toEqual(['task-0'])
+    const receipt = await f.store.read<{state: string; planDigest: string}>('resource-retention/seed')
+    expect(receipt).toMatchObject({ state: 'active', planDigest: f.preflight.planDigest })
+    const recovered = new EvaluationSearchAdapter(f.evaluator, f.options)
+    expect(await recovered.verifyCells(cells.map(cell => ({ cell, identity: cell.identity })))).toBe(true)
+    f.evaluator.resourcePreflight = async () => ({ ...f.preflight, plans: f.preflight.plans.map(p => ({ ...p, platform: 'linux/arm64' })) })
+    await expect(recovered.verifyCells(cells.map(cell => ({ cell, identity: cell.identity })))).rejects.toThrow(/plan mismatch/)
+    expect(f.requests).toHaveLength(1)
+  })
+})
+
 describe('Gear-owned staging through the existing evaluation interface', () => {
+  it('checks shared dataset/runtime identity twice per 100-cell batch instead of twice per cell', async () => {
+    const f = await setup(false)
+    const input = await batchInput(f, Array.from({ length: 100 }, (_, i) => `task-${i}`))
+    const cells = await f.provider.evaluate(input), checks = cells.map(cell => ({ cell, identity: cell.identity }))
+    const identity = vi.spyOn(f.evaluator, 'evaluationIdentity')
+    for (const { cell, identity: expected } of checks) expect(await f.provider.verifyCell(cell, expected)).toBe(true)
+    expect(identity).toHaveBeenCalledTimes(200)
+    identity.mockClear()
+    expect(await f.provider.verifyCells(checks)).toBe(true)
+    expect(identity).toHaveBeenCalledTimes(2)
+    // No success cache survives the call boundary.
+    f.changeRuntime()
+    await expect(f.provider.verifyCells(checks)).rejects.toThrow('runtime configuration changed')
+    expect(f.requests).toHaveLength(1)
+  })
+
+  it.each(['full', 'projected'] as const)('detects %s dataset changes on the next batch and does not cache failures', async changed => {
+    const f = await setup(false, 1, false, 5)
+    f.options.identityRound.plan.seed.dataset = f.spec.datasets.seed
+    const original = f.evaluator.evaluationIdentity!
+    f.evaluator.evaluationIdentity = async (round, request, signal) => {
+      const identity = (await original(round, request, signal))!
+      return { ...identity, effectiveConfigDigest: digestJson([identity, await digestDatasetRef(request.dataset, round.workspaceRoot)]) }
+    }
+    const evaluate = f.evaluator.evaluate.bind(f.evaluator)
+    f.evaluator.evaluate = async (round, request, signal, reservation) => {
+      const evidence = await evaluate(round, request, signal, reservation)
+      return Object.assign(evidence, await f.evaluator.evaluationIdentity!(round, request, signal))
+    }
+    const input = await batchInput(f, ['task-0', 'task-1'])
+    const cells = await f.provider.evaluate(input), checks = cells.map(cell => ({ cell, identity: cell.identity }))
+    expect(await f.provider.verifyCells(checks)).toBe(true)
+    const path = join(changed === 'full' ? f.spec.datasets.seed.ref : f.requests[0]!.dataset, 'extra.txt')
+    await writeFile(path, 'changed after successful validation')
+    await expect(f.provider.verifyCells(checks)).rejects.toThrow('runtime configuration changed')
+    await rm(path)
+    expect(await f.provider.verifyCells(checks)).toBe(true)
+  })
+
+  it('checks every source batch while sharing only its partition verification', async () => {
+    const f = await setup(false, 1, false, 5)
+    const first = await f.provider.evaluate(await batchInput(f, ['task-0', 'task-1'], 'first'))
+    const second = await f.provider.evaluate(await batchInput(f, ['task-2', 'task-3'], 'second'))
+    const checks = [...first, ...second].map(cell => ({ cell, identity: cell.identity }))
+    const original = f.evaluator.evaluationIdentity!
+    const identity = vi.spyOn(f.evaluator, 'evaluationIdentity')
+    expect(await f.provider.verifyCells(checks)).toBe(true)
+    expect(identity).toHaveBeenCalledTimes(3) // one full dataset, two physical batches
+    identity.mockImplementation(async (round, request, signal) => request.dataset === f.requests[1]!.dataset
+      ? { provider: 'changed-second-batch', effectiveConfigDigest: digestJson('changed') }
+      : original(round, request, signal))
+    await expect(f.provider.verifyCells(checks)).rejects.toThrow('runtime configuration changed')
+  })
+
+  it('still rejects corrupt, foreign, missing and incorrectly bound individual cells', async () => {
+    const f = await setup(false, 1, false, 5)
+    const cells = await f.provider.evaluate(await batchInput(f, ['task-0', 'task-1']))
+    const checks = cells.map(cell => ({ cell, identity: cell.identity })), last = cells[1]!
+    await expect(f.provider.verifyCells([checks[0]!, { cell: { ...last, evidenceRef: 'tampered' }, identity: last.identity }])).rejects.toThrow('digest mismatch')
+    const { digest: ignored, ...body } = last
+    expect(await f.provider.verifyCells([checks[0]!, { cell: seal({ ...body, evidenceRef: 'foreign' }), identity: last.identity }])).toBe(false)
+    expect(await f.provider.verifyCells([checks[0]!, { cell: last, identity: cells[0]!.identity }])).toBe(false)
+    await rm(join(f.store.root, `evaluator-cells/${cellKey(last.identity).slice(7)}.json`))
+    expect(await f.provider.verifyCells(checks)).toBe(false)
+  })
+
+  it('preserves the expected identity and rejection semantics for providers without batching', async () => {
+    const f = await setup(false, 1, false, 5)
+    const cells = await f.provider.evaluate(await batchInput(f, ['task-0', 'task-1']))
+    const checks = cells.map(cell => ({ cell, identity: { ...cell.identity, snapshotDigest: digestJson('new-lineage') } }))
+    const single = vi.fn().mockResolvedValueOnce(true).mockResolvedValueOnce(false)
+    const provider = { ...f.provider, describe: f.provider.describe.bind(f.provider), evaluate: f.provider.evaluate.bind(f.provider), verifyCell: single }
+    expect(await verifyCells(provider, checks)).toBe(false)
+    expect(single.mock.calls).toEqual(checks.map(({ cell, identity }) => [cell, identity]))
+    expect(await verifyCells(provider, [])).toBe(true)
+    expect(single).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not settle evaluation evidence when the batch provider rejects any cell', async () => {
+    const f = await setup(false)
+    const verify = vi.spyOn(f.provider, 'verifyCells').mockResolvedValue(false)
+    await expect(f.run()).rejects.toThrow('provider rejected cell provenance')
+    expect(verify).toHaveBeenCalledTimes(1)
+    expect(verify.mock.calls[0]![0]).toHaveLength(100)
+    expect(await f.store.archive()).toBeUndefined()
+    expect((await f.store.read<{ operations: Array<{ status: string }> }>('budget'))!.operations[0]!.status).toBe('reserved')
+  })
+  it.each(['valid', 'corrupt', 'foreign-run'] as const)('imports complete verifier artifacts and binds custom metrics to their original run (%s)', async mode => {
+    const f = await setup(false, 1, false, 5)
+    const path = join(f.spec.datasets.seed.ref, 'benchmark.adapter.json'), manifest = JSON.parse(await readFile(path, 'utf8'))
+    manifest.raw_metrics.metrics.push({ id: 'rubric_quality', revision: '1', unit: 'points', direction: 'maximize',
+      source: { path: 'verifier.result.rewards.quality', extractor: 'number-v1' }, granularity: 'trial',
+      repetitionReducer: 'mean', taskReducer: 'weighted-mean', comparisonPrecision: 1e-9 })
+    const { dataset_digest: ignored, ...body } = manifest
+    await writeFile(path, JSON.stringify({ ...body, dataset_digest: digestJson(body) }))
+    f.spec.datasets.seed.digest = await digestDatasetRef(f.spec.datasets.seed.ref)
+    f.spec.rawMetricsVersion = 1
+    f.spec.objective = resolveObjective({ terms: [{ metric: 'rubric_quality', weight: 1 }] }, (await f.provider.describe('seed')).rawMetricContracts!)
+    const original = { rewards: { quality: 23, unused: 81 }, rubric: { components: [{ id: 'optional', status: 'excluded', weight: 3 }] } }
+    Reflect.deleteProperty(f.evaluator, 'inspectVerifierEvidence')
+    await expect(new EvaluationSearchAdapter(f.evaluator, f.options).describe('seed')).rejects.toThrow('verifier evidence capability')
+    expect(f.requests).toHaveLength(0)
+    f.evaluator.inspectVerifierEvidence = async (runId: string) => {
+      const evidence = [...f.observations.values()].find(e => e.trials.some(t => t.runId === runId))!
+      return { runId: mode === 'foreign-run' ? 'foreign' : runId, parent: { evalId: evidence.evalId, trialId: runId, attempt: 1 },
+        observation: { status: 'valid' }, verifier: { status: mode === 'corrupt' ? 'corrupt' : 'result_only', result: original, resultSha256: digestJson(original) } }
+    }
+    const provider = new EvaluationSearchAdapter(f.evaluator, f.options), universe = await provider.describe('seed')
+    const plan = stagePlan({ stage: 'local', partition: 'seed', universeDigest: universe.digest, taskSetSizeResolutionDigest: digestJson('sizing'), scopeDigest: digestJson('scope'),
+      taskIds: ['task-0'], participantIds: [f.source.anchor.candidateId], prerequisiteDecisionDigests: [], selectionRuleDigest: digestJson('rule') })
+    const input = { plan, snapshot: f.source.anchor, cells: [cellIdentity(universe, 'task-0', 0, f.source.anchor)], idempotencyKey: digestJson('raw-verifier'), signal: new AbortController().signal }
+    if (mode === 'foreign-run') { await expect(provider.evaluate(input)).rejects.toThrow('does not match its run'); return }
+    const cells = await provider.evaluate(input), projected = objectiveProfile(universe, plan.taskIds, cells)
+    expect(projected.objectiveScore).toMatchObject(mode === 'valid' ? { status: 'available', score: 23 } : { status: 'invalid' })
+    const pointer = await f.store.read<{ ref: string }>(`evolution/verifier-${digestJson(cells[0]!.evidenceRef).slice(7)}`)
+    const artifact = await f.store.object<{ digest: string; evidence: HitchVerifierEvidence }>(pointer!.ref)
+    expect(artifact.evidence.verifier.result).toEqual(original)
+    expect(cells[0]!.rawMetrics!.originalArtifactRefs).toContain(artifact.digest)
+    await provider.evaluate(input)
+    expect(f.requests).toHaveLength(1)
+  })
+  it('investigates successful but expensive tasks and retains unselected runtime data', async () => {
+    const f = await setup(false, 1, false, 10)
+    for (const partition of ['seed', 'heldOut'] as const) {
+      const path = join(f.spec.datasets[partition].ref, 'benchmark.adapter.json')
+      const manifest = JSON.parse(await readFile(path, 'utf8'))
+      manifest.raw_metrics.metrics.push({ id: 'api_cost_usd', revision: '1', unit: 'USD', direction: 'minimize',
+        source: { path: 'originalResult.usage.cost', extractor: 'number-v1' }, granularity: 'trial', repetitionReducer: 'mean', taskReducer: 'weighted-mean', comparisonPrecision: 1e-9,
+        measurement: { kind: 'actual', scope: 'all target, auxiliary, reducer, compaction and child calls including internal retries', providerModels: ['test/model'],
+          priceSnapshot: digestJson('fixture-prices'), tokenAccounting: 'all input/output and cache buckets, reasoning included in output', timeBoundary: 'trial start to settlement', retryAccounting: 'all internal retries; infrastructure reruns separate' } })
+      const { dataset_digest: ignored, ...body } = manifest
+      await writeFile(path, JSON.stringify({ ...body, dataset_digest: digestJson(body) }))
+      f.spec.datasets[partition].digest = await digestDatasetRef(f.spec.datasets[partition].ref)
+    }
+    const evaluate = f.evaluator.evaluate.bind(f.evaluator)
+    f.evaluator.evaluate = async (...args) => {
+      const evidence = await evaluate(...args), cheap = args[1].harnessRef !== f.source.anchor.commit
+      evidence.trials = evidence.trials.map(t => ({ ...t, rewards: { reward: 1, unselected: 17 }, scores: { totalScore: 1, normalization: 'standard' },
+        originalResult: { usage: { cost: cheap ? .5 : 1, tokens: 12345, cacheReadTokens: 1000, auxiliaryCalls: 2 }, extraRubric: { unselected: 17 } } }))
+      evidence.primaryReward = 1; evidence.summary.score = 1
+      return evidence
+    }
+    f.spec.rawMetricsVersion = 1
+    const described = await f.provider.describe('seed')
+    f.spec.objective = resolveObjective({ terms: [{ metric: 'api_cost_usd', weight: -1 }], constraints: [{ metric: 'pass_rate', rule: 'no_regression', reference: 'initial_baseline' }] }, described.rawMetricContracts!)
+    const provider = new EvaluationSearchAdapter(f.evaluator, f.options)
+    const outcome = await f.run(provider)
+    expect(outcome).toMatchObject({ championChanged: true, promotion: { objectiveScore: { score: -.5 } } })
+    const archive = (await f.store.archive())!
+    expect(archive.clusters.some(c => c.familyId.startsWith('objective-'))).toBe(true)
+    const baseline = archive.results.find(r => r.snapshotDigest === f.source.anchor.digest)!
+    expect(baseline.cells.every(c => c.outcome.status === 'available' && c.outcome.rawValue === 1)).toBe(true)
+    const pointer = await f.store.read<{ ref: string }>(`evaluator-cells/${digestJson((({ snapshotDigest, ...identity }) => identity)(baseline.cells[0]!.identity)).slice(7)}`)
+    const source = await f.store.object<{ digest: string; evidence: EvaluationEvidence }>(pointer!.ref)
+    expect(source.evidence.trials[0]!.originalResult).toMatchObject({ usage: { tokens: 12345, cacheReadTokens: 1000, auxiliaryCalls: 2 }, extraRubric: { unselected: 17 } })
+    expect(outcome.research.candidates[0]!.profile.rawMetrics!.api_cost_usd).toMatchObject({ value: .5, status: 'available' })
+  }, 30000)
+  it('runs inline weighted objectives through real dataset projection, diagnosis, all stages and frozen constraints', async () => {
+    const f = await setup(true, 1, false, 10)
+    f.spec.rawMetricsVersion = 1
+    const described = await f.provider.describe('seed')
+    f.spec.objective = resolveObjective({ terms: [{ metric: 'pass_rate', weight: .5 }, { metric: 'process_score', weight: .5 }],
+      constraints: [{ metric: 'pass_rate', rule: 'no_regression', reference: 'initial_baseline' }] }, described.rawMetricContracts!)
+    const provider = new EvaluationSearchAdapter(f.evaluator, f.options)
+    const result = await f.run(provider)
+    expect(result.championChanged).toBe(true)
+    expect(result.promotion).toMatchObject({ outcome: 'accepted', objectiveScore: { score: 1, constraintResults: [{ status: 'passed' }] } })
+    expect(result.research.candidates.length).toBeGreaterThan(0)
+    expect(result.research.candidates.every(c => c.profile.objectiveComplete)).toBe(true)
+    expect(result.research.scopeViews.flatMap(s => s.fronts).every(front => front.channel === 'objective')).toBe(true)
+    const checkpoint = f.requests.length
+    expect((await f.run(new EvaluationSearchAdapter(f.evaluator, f.options))).digest).toBe(result.digest)
+    expect(f.requests).toHaveLength(checkpoint)
+    const archive = await f.store.archive()
+    expect(archive!.results.every(r => r.cells.every(c => c.rawMetrics?.metrics.total_score?.status === 'available'))).toBe(true)
+    const progress = await f.store.read<{ evaluations: Array<{ stage: string; profile?: { objectiveScore?: unknown } }> }>('rounds/r/progress')
+    expect(progress!.evaluations.every(e => e.stage !== 'held-out')).toBe(true)
+    expect(progress!.evaluations.some(e => e.profile?.objectiveScore)).toBe(true)
+  }, 30000)
   it('resolves projected verifier runs after restart, including physical attempt 1 for the second repetition', async () => {
     const f = await setup(false, 2), universe = await f.provider.describe('seed'), signal = new AbortController().signal
     const plan = stagePlan({ stage: 'local', partition: 'seed', universeDigest: universe.digest,

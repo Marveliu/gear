@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
 import { HitchCliEvaluator } from '../../src/evaluator/hitch-cli.js'
+import { RefineStateStore } from '../../src/state/store.js'
 import { digestDatasetRef } from '../../src/state/dataset.js'
 import { RefineCapabilities } from '../../src/capabilities.js'
 import { renderTrajectoryResult } from '../../src/notebook/tool.js'
@@ -696,7 +697,8 @@ describe('HitchCliEvaluator', () => {
     const state = round(fixture.root, fixture.championRef, fixture.manifest.digest)
     const { digest: ignored, ...anchor } = fixtures(2, false).anchor
     const snapshot = seal({ ...anchor, commit: fixture.championRef, manifestDigest: fixture.manifest.digest })
-    const options = { spec, workspaceRoot: fixture.root, stateRoot: join(fixture.root, 'search'), identityRound: state,
+    const lock = await new RefineStateStore(fixture.root).acquireRoundLock()
+    const options = { lock: async () => lock, spec, workspaceRoot: fixture.root, stateRoot: join(fixture.root, 'search'), identityRound: state,
       round: async () => state, manifest: async () => fixture.manifest }
     const provider = new EvaluationSearchAdapter(evaluator, options), universe = await provider.describe('seed')
     const plan = stagePlan({ stage: 'local', partition: 'seed', universeDigest: universe.digest,
@@ -910,7 +912,8 @@ describe('HitchCliEvaluator', () => {
       primaryReward: 1,
       processScore: 0.5,
       summary: { score: 1, process: { score: 0.5 }, metrics: { totalScore: 1, processScore: 0.5 } },
-      trials: [{ scores: { totalScore: 1, processScore: 0.5, normalization: 'standard' } }],
+      trials: [{ scores: { totalScore: 1, processScore: 0.5, normalization: 'standard' },
+        originalResult: { scores: { total_score: 1, process_score: 0.5 }, verifier_result_ref: 'verifier/result.json' } }],
     })
 
     const totalOnly = await setup('0.2.8')
@@ -1127,7 +1130,8 @@ describe('HitchCliEvaluator', () => {
       remainingInvalidTrials: [{ taskId: 'task-1', attempt: 1 }],
       evidence: {
         evalId, completeness: 'partial', plannedTrialCount: 1, trials: [],
-        invalidTrials: [{ taskName: 'task-1', attempt: 1, invalidReason: 'infrastructure_failure' }],
+        invalidTrials: [{ taskName: 'task-1', attempt: 1, invalidReason: 'infrastructure_failure',
+          originalResult: { observation_status: 'invalid', invalid_reason: 'infrastructure_failure', verifier_result_ref: 'verifier/result.json' } }],
       },
     })
   })
@@ -1140,6 +1144,7 @@ describe('HitchCliEvaluator', () => {
       new AbortController().signal,
     )
     expect(evidence).toMatchObject({ primaryReward: 1, trials: [{ taskName: 'task-1' }] })
+    expect(evidence.trials[0]?.originalResult).toMatchObject({ task_name: 'task-1', rewards: { reward: 1 } })
   })
 
   it('reads bounded Hitch analysis and source-paged events', async () => {
